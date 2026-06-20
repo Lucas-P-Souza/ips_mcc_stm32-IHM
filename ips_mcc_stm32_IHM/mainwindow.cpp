@@ -8,52 +8,99 @@
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWindow) {
     ui->setupUi(this);
+
+    // ========================================================================
+    // BLOCK 1: Serial port initialization and initial UI state
+    // ========================================================================
     serial = new QSerialPort(this);
 
+    // Scan system for available COM/ttyACM ports
     ui->boxPorta->clear();
     const auto portas = QSerialPortInfo::availablePorts();
     for (const QSerialPortInfo &info : portas) {
         ui->boxPorta->addItem(info.systemLocation());
     }
 
+    // Ensure UI initializes in Open Loop (PWM) mode by default
+    ui->sliderPWM->setEnabled(true);
+    ui->speedBox->setEnabled(false);
+
+    // Update PWM percentage label when slider moves
     connect(ui->sliderPWM, &QSlider::valueChanged, this, [=](int valor){
-        ui->labelPWM->setText(QString::number(valor) + "%");
+        ui->labelPWM->setText(QString::number(valor) + " %");
     });
 
-    // --- COLE ISSO AQUI: CRIANDO A LINHA DO CANAL I ---
-    ui->graficoRPM->addGraph(); // Cria o graph(1) para o Canal I (Laranja)
-    ui->graficoRPM->graph(0)->setPen(QPen(QColor(255, 140, 0), 2)); // Laranja escuro
+    // Connect UART data reception to telemetry handler
+    connect(serial, &QSerialPort::readyRead, this, &MainWindow::dadosRecebidos);
+
+    // ========================================================================
+    // BLOCK 2: RPM (Speed) graph configuration
+    // ========================================================================
+    // Graph 0 (Orange): Absolute RPM from encoder Index (Channel I)
+    ui->graficoRPM->addGraph();
+    ui->graficoRPM->graph(0)->setPen(QPen(QColor(255, 140, 0), 2));
     ui->graficoRPM->graph(0)->setAntialiased(true);
 
-    // --- CONFIGURAÇÃO GRÁFICO RPM ---
+    // Graph 1 (Blue): RPM from quadrature encoder (Channels A/B)
     ui->graficoRPM->addGraph();
     ui->graficoRPM->graph(1)->setPen(QPen(Qt::blue, 2));
     ui->graficoRPM->graph(1)->setAntialiased(true);
 
     ui->graficoRPM->yAxis->setLabel("Velocidade (RPM)");
     ui->graficoRPM->xAxis->setLabel("Tempo (s)");
-    ui->graficoRPM->yAxis->setRange(0, 4000);
+    ui->graficoRPM->yAxis->setRange(0, 1000);
+    ui->graficoRPM->setInteractions(QCP::iRangeDrag | QCP::iRangeZoom);
 
-    // --- TEMPORÁRIO: LINHA VERDE DE 63% ---
+    // ========================================================================
+    // BLOCK 3: Current graph configuration
+    // ========================================================================
+    // Graph 0 (Red): Current sensor data (ADC)
+    ui->graficoCorrente->addGraph();
+    ui->graficoCorrente->graph(0)->setPen(QPen(Qt::red, 2));
+
+    ui->graficoCorrente->yAxis->setLabel("Corrente (A)");
+    ui->graficoCorrente->xAxis->setLabel("Tempo (s)");
+    ui->graficoCorrente->yAxis->setRange(0, 1.5);
+    ui->graficoCorrente->setInteractions(QCP::iRangeDrag | QCP::iRangeZoom);
+
+    // ========================================================================
+    // BLOCK 4: Step response (Tau) reference line configuration
+    // ========================================================================
+    // Dashed green horizontal line for visual target reference
     linhaTau = new QCPItemStraightLine(ui->graficoRPM);
     linhaTau->setPen(QPen(Qt::darkGreen, 2, Qt::DashLine));
     linhaTau->point1->setCoords(0, 0);
     linhaTau->point2->setCoords(1, 0);
-
-    // --- CONFIGURAÇÃO GRÁFICO CORRENTE ---
-    ui->graficoCorrente->addGraph();
-    ui->graficoCorrente->graph(0)->setPen(QPen(Qt::red, 2));
-    ui->graficoCorrente->yAxis->setLabel("Corrente (A)");
-    ui->graficoCorrente->yAxis->setRange(-0.2, 3.0);
-
-    ui->graficoRPM->setInteractions(QCP::iRangeDrag | QCP::iRangeZoom);
-    ui->graficoCorrente->setInteractions(QCP::iRangeDrag | QCP::iRangeZoom);
-
-    connect(serial, &QSerialPort::readyRead, this, &MainWindow::dadosRecebidos);
 }
 
-MainWindow::~MainWindow() { delete ui; }
+MainWindow::~MainWindow() {
+    delete ui;
+}
 
+// ========================================================================
+// BLOCK 5: Control mode switching (ComboBox)
+// ========================================================================
+void MainWindow::on_controleBox_currentIndexChanged(int index) {
+    // Reset all actuators for safety during mode transition
+    ui->sliderPWM->setValue(0);
+    ui->speedBox->setValue(0);
+
+    if (index == 0) {
+        // --- OPEN LOOP MODE (PWM) ---
+        ui->sliderPWM->setEnabled(true);
+        ui->speedBox->setEnabled(false);
+        qDebug() << "Modo selecionado: Malha Aberta (Atuador direto por PWM)";
+    } else {
+        // --- CLOSED LOOP MODE (Speed Asservissement) ---
+        ui->sliderPWM->setEnabled(false);
+        ui->speedBox->setEnabled(true);
+        qDebug() << "Modo selecionado: Asservissement (Referência por VITESSE)";
+    }
+}
+
+// ========================================================================
+// BLOCK 6: Serial connection management
+// ========================================================================
 void MainWindow::on_btnConectar_clicked() {
     if(serial->isOpen()) {
         serial->close();
@@ -67,12 +114,12 @@ void MainWindow::on_btnConectar_clicked() {
             ui->btnConectar->setText("Déconnecter");
             serial->clear();
 
+            // Clear plots for a new clean capture
             ui->graficoRPM->graph(0)->data()->clear();
             ui->graficoRPM->graph(1)->data()->clear();
-
             ui->graficoCorrente->graph(0)->data()->clear();
 
-            tempo_conexao = -1.0;
+            tempo_conexao = -1.0; // Signal plot time offset reset
 
             qDebug() << "Conectado com sucesso na porta:" << portaSelecionada;
         } else {
@@ -81,147 +128,161 @@ void MainWindow::on_btnConectar_clicked() {
     }
 }
 
+// ========================================================================
+// BLOCK 7: UART telemetry parsing
+// ========================================================================
 void MainWindow::dadosRecebidos() {
     while (serial->canReadLine()) {
         QByteArray buffer = serial->readLine();
+
+        // 'linha' = string holding the trimmed incoming serial data line
         QString linha = QString::fromLatin1(buffer).trimmed();
+
+        // 'valores' = string list containing parsed CSV tokens from the serial packet
         QStringList valores = linha.split(",");
 
+        // Data integrity validation: STM32 string must have 5 columns
         if (valores.size() >= 5) {
             bool okT, okR, okA, okV, okRI;
 
+            // Convert raw UART data strings into engineering units
+            // t = raw MCU time converted from ms to seconds
             double t = valores[0].toDouble(&okT) / 1000.0;
-            double rpm = qAbs(valores[1].toDouble(&okR));          // RPM original (A/B)
+            // amp = raw current converted from mA to Amperes
             double amp = valores[2].toDouble(&okA) / 1000.0;
-            int voltas = valores[3].toInt(&okV);                    // Voltas completas
-            double rpm_canal_i = qAbs(valores[4].toDouble(&okRI));  // Novo RPM do Canal I
+            // voltas = accumulated mechanical turn counter from MCU
+            int voltas = valores[3].toInt(&okV);
 
-            // Verifica se TODAS as 5 variáveis vieram corretas
+            // rpm & rpm_canal_i = raw values scaled by an 11/10 transmission ratio correction factor
+            double rpm = qAbs(valores[1].toDouble(&okR)) * 11/10;
+            double rpm_canal_i = qAbs(valores[4].toDouble(&okRI)) * 11/10;
+
             if (okT && okR && okA && okV && okRI) {
 
-                // --- 1. TARA DO BOTÃO CONECTAR (Gráfico começa em zero) ---
+                // 'tempo_conexao' = baseline timestamp anchor used to tare the graph axis to 0s on startup
                 if (tempo_conexao < 0) {
-                    tempo_conexao = t; // Captura o primeiro tempo que a STM32 mandou
+                    tempo_conexao = t;
                 }
-                double t_grafico = t - tempo_conexao; // Tempo que vai pro gráfico
+                // 't_grafico' = relative elapsed time in seconds for real-time plotting
+                double t_grafico = t - tempo_conexao;
 
-                // --- 2. TARA DO BOTÃO ENVIAR (CSV e Voltas começam em zero) ---
-                double t_csv = t_grafico; // Por padrão, copia o gráfico
-                int voltas_csv = voltas;
-
+                // ========================================================================
+                // STEP RESPONSE (TAU) ANALYSIS
+                // ========================================================================
+                // 'cronometro_rodando' = flag tracking if a step-response transient test is active
+                // 'esperando_inicio_degrau' = flag waiting for the exact inflection timestamp of the step command
                 if (cronometro_rodando && esperando_inicio_degrau) {
-                    tempo_zero = t_grafico; // Guarda o tempo exato do clique
-                    voltas_zero = voltas;   // Guarda as voltas do clique
+                    tempo_zero = t_grafico; // Capture step test start execution time
                     esperando_inicio_degrau = false;
+                    qDebug() << ">>> Cálculo do Tau iniciado em t =" << tempo_zero;
                 }
 
                 if (cronometro_rodando) {
-                    t = t - tempo_zero;
-                    voltas = voltas - voltas_zero;
+                    // Mechanical Tau analytical stop condition (reached 63.2% of target speed 'alvo_rpm_tau')
+                    if (rpm >= alvo_rpm_tau) {
+                        float resultado_tau = t_grafico - tempo_zero;
+                        qDebug() << "-----------------------------------";
+                        qDebug() << "TAU MECÂNICO ENCONTRADO!";
+                        qDebug() << "TAU:" << resultado_tau << "segundos";
+                        qDebug() << "-----------------------------------";
+                        cronometro_rodando = false;
+                    }
                 }
 
-                if (arquivoCSV.isOpen() && cronometro_rodando) {
+                // ========================================================================
+                // INDEPENDENT CSV RECORDING
+                // ========================================================================
+                // 'gravando_csv' = flag tracking if filesystem data logging is active
+                if (gravando_csv && arquivoCSV.isOpen()) {
+                    // 'esperando_inicio_csv' = tares time and turn counters on the first logged packet
+                    if (esperando_inicio_csv) {
+                        tempo_zero_csv = t_grafico; // Save file baseline time tare
+                        voltas_zero_csv = voltas;   // Save file baseline turn tare
+                        esperando_inicio_csv = false;
+                    }
+
+                    // Normalize temporal and mechanical variables to start strictly at zero inside the CSV file
+                    double t_csv_indep = t_grafico - tempo_zero_csv;
+                    int voltas_csv_indep = voltas - voltas_zero_csv;
+
                     QTextStream stream(&arquivoCSV);
-                    // Escreve as variáveis separadas por vírgula
-                    stream << t_csv << ","
+                    stream << t_csv_indep << ","
                            << rpm << ","
                            << amp << ","
-                           << voltas_csv << ","
+                           << voltas_csv_indep << ","
                            << rpm_canal_i << "\n";
                 }
 
-                // --- TEMPORÁRIO: LÓGICA DO CRONÔMETRO TAU ---
-                if (cronometro_rodando) {
-                    // Sincroniza o tempo zero com o primeiro dado após o clique
-                    if (esperando_inicio_degrau) {
-                        tempo_zero = t;
-                        voltas_zero = voltas;
-                        esperando_inicio_degrau = false;
-                        qDebug() << ">>> Degrau iniciado em t =" << tempo_zero;
-                    }
+                // --- RPM PLOT UPDATE ---
+                ui->graficoRPM->graph(1)->addData(t_grafico, rpm);         // Blue curve (A/B quadrature)
+                ui->graficoRPM->graph(0)->addData(t_grafico, rpm_canal_i); // Orange curve (Index Channel I)
+                ui->graficoRPM->xAxis->setRange(t_grafico, 5, Qt::AlignRight); // 5-second moving window
 
-                    // Verifica se atingiu 68% (1177.41 RPM)
-                    if (rpm >= alvo_rpm_tau) {
-                        float resultado_tau = t - tempo_zero;
-                        qDebug() << "-----------------------------------";
-                        qDebug() << "TAU MECÂNICO ENCONTRADO!";
-                        qDebug() << "Tempo Final:" << t;
-                        qDebug() << "TAU:" << resultado_tau << "segundos";
-                        qDebug() << "-----------------------------------";
-                        cronometro_rodando = false; // Para a medição
-                    }
-                }
-
-                // --- TEMPORÁRIO: ATUALIZAÇÃO DA ALTURA DA LINHA VERDE ---
-                if (rpm > max_rpm_teste) {
-                    max_rpm_teste = rpm;
-                    double altura_63 = max_rpm_teste * 0.68;
-                    linhaTau->point1->setCoords(0, altura_63);
-                    linhaTau->point2->setCoords(1, altura_63);
-                }
-
-                // --- ATUALIZAÇÃO DOS GRÁFICOS ---
-                ui->graficoRPM->graph(1)->addData(t_grafico, rpm);
-                ui->graficoRPM->graph(0)->addData(t_grafico, rpm_canal_i);
-                ui->graficoCorrente->graph(0)->addData(t_grafico, amp);
-
-                qDebug() << "[DEBUG] Tempo:" << QString::number(t_grafico, 'f', 2)
-                         << "s | RPM A/B:" << rpm
-                         << "| RPM REAL (Canal I):" << rpm_canal_i;
-
-                ui->graficoRPM->xAxis->setRange(t_grafico, 5, Qt::AlignRight);
-                ui->graficoCorrente->xAxis->setRange(t_grafico, 5, Qt::AlignRight);
-
-                ui->lblVelocidade->setText(QString::number(rpm_canal_i, 'f', 1) + " RPM");
-                ui->lblCorrente->setText(QString::number(amp, 'f', 2) + " A");
+                ui->lblVelocidadeAB->setText(QString::number(rpm, 'f', 1) + " RPM -> AB");
+                ui->lblVelocidadeAB->setText(QString::number(rpm_canal_i, 'f', 1) + " RPM -> I");
 
                 if (rpm > ui->graficoRPM->yAxis->range().upper) {
                     ui->graficoRPM->yAxis->setRangeUpper(rpm * 1.2);
                 }
+
+                // --- CURRENT PLOT UPDATE ---
+                ui->graficoCorrente->graph(0)->addData(t_grafico, amp);
+                ui->graficoCorrente->xAxis->setRange(t_grafico, 5, Qt::AlignRight);
+                ui->lblCorrente->setText(QString::number(amp, 'f', 2) + " A");
+
                 if (amp > ui->graficoCorrente->yAxis->range().upper && amp < 100) {
                     ui->graficoCorrente->yAxis->setRangeUpper(amp * 1.2);
                 }
             }
         }
     }
+
     ui->graficoRPM->replot();
     ui->graficoCorrente->replot();
 }
 
+// ========================================================================
+// BLOCK 8: Actuation command transmission
+// ========================================================================
 void MainWindow::on_btnEnviar_clicked() {
     if(serial->isOpen()) {
         serial->clear(QSerialPort::Output);
 
-        // --- TEMPORÁRIO: RESET PARA NOVO TESTE DE TAU ---
-        max_rpm_teste = 0.0;
-        linhaTau->point1->setCoords(0, 0);
-        linhaTau->point2->setCoords(1, 0);
+        int valor_alvo = 0; // Target value accumulator (can represent PWM % or Target RPM)
+        int dir = ui->radioHorario->isChecked() ? 1 : 0;
+        QString cmd;
 
-        int pwm = ui->sliderPWM->value();
+        if (ui->controleBox->currentIndex() == 0) {
+            valor_alvo = ui->sliderPWM->value();
+            cmd = QString("P%1,S%2\n").arg(valor_alvo).arg(dir);
+        } else {
+            valor_alvo = ui->speedBox->value();
+            cmd = QString("V%1,S%2\n").arg(valor_alvo).arg(dir);
+        }
 
-        // Dispara o cronômetro se o PWM for maior que zero (degrau)
-        if (pwm > 0) {
+        // ========================================================================
+        // TRIGGER TAU ANALYTICS (Math only, no file handling)
+        // ========================================================================
+        if (ui->controleBox->currentIndex() == 1) {
+            // If in Closed Loop (Asservissement), place the reference line at exact target coordinate
+            linhaTau->point1->setCoords(0, valor_alvo);
+            linhaTau->point2->setCoords(1, valor_alvo);
+        } else {
+            // If in Open Loop (PWM), hide the reference line out of view at zero
+            linhaTau->point1->setCoords(0, 0);
+            linhaTau->point2->setCoords(1, 0);
+        }
+
+        ui->graficoRPM->replot(); // Force immediate plot update to render line change
+
+        if (valor_alvo > 0) {
             esperando_inicio_degrau = true;
             cronometro_rodando = true;
-            qDebug() << "Cronômetro armado. Alvo:" << alvo_rpm_tau << "RPM";
-
-            arquivoCSV.setFileName("dados_motor.csv");
-            if(arquivoCSV.open(QIODevice::WriteOnly | QIODevice::Text)) {
-                QTextStream stream(&arquivoCSV);
-                // Escreve o cabeçalho da tabela com todas as colunas!
-                stream << "Tempo_s,RPM_AB,Corrente_A,Voltas,RPM_I\n";
-            }
-        }
-        else {
-            // Se o PWM for 0 (mandou parar), fecha e salva o arquivo no PC!
-            if(arquivoCSV.isOpen()) {
-                arquivoCSV.close();
-                qDebug() << "Arquivo CSV salvo e fechado!";
-            }
+            qDebug() << "Análise de Tau armada. Alvo analítico:" << alvo_rpm_tau << "RPM";
+        } else {
+            cronometro_rodando = false;
         }
 
-        int dir = ui->radioHorario->isChecked() ? 1 : 0;
-        QString cmd = QString("P%1,S%2\n").arg(pwm).arg(dir);
         serial->write(cmd.toLatin1());
         serial->flush();
 
@@ -229,22 +290,59 @@ void MainWindow::on_btnEnviar_clicked() {
     }
 }
 
+// ========================================================================
+// BLOCK 9: Emergency break safety interlock
+// ========================================================================
 void MainWindow::on_breakButton_toggled(bool checked) {
     if(serial->isOpen()) {
         serial->clear(QSerialPort::Output);
-        QString cmd = QString("B%1\n").arg(checked ? 1 : 0);
-        serial->write(cmd.toLatin1());
-        serial->flush();
-
-        if(arquivoCSV.isOpen()) {
-            arquivoCSV.close();
-            qDebug() << "Arquivo CSV salvo por Freio de Emergência!";
-        }
 
         if (checked) {
+            ui->sliderPWM->setValue(0);
+            ui->speedBox->setValue(0);
             ui->breakButton->setText("TURN OFF BREAK");
+
+            // --- SAFETY: Auto-disable recording button if active ---
+            if (ui->btnGravar->isChecked()) {
+                ui->btnGravar->setChecked(false); // Automatically triggers Block 10 to close the file safely
+            }
         } else {
             ui->breakButton->setText("TURN ON BREAK");
         }
+
+        QString cmd = QString("B%1\n").arg(checked ? 1 : 0);
+        serial->write(cmd.toLatin1());
+        serial->flush();
+    }
+}
+
+// ========================================================================
+// BLOCK 10: CSV recording toggle control
+// ========================================================================
+void MainWindow::on_btnGravar_toggled(bool checked) {
+    if (checked) {
+        // Initialize and create test CSV file
+        arquivoCSV.setFileName("dados_motor.csv");
+        if(arquivoCSV.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream stream(&arquivoCSV);
+            stream << "Tempo_s,RPM_AB,Corrente_A,Voltas,RPM_I\n"; // File log header
+
+            gravando_csv = true;
+            esperando_inicio_csv = true; // Force time tare on next incoming UART packet
+
+            ui->btnGravar->setText("Parar Gravação");
+            qDebug() << ">>> GRAVAÇÃO INICIADA (Arquivo dados_motor.csv criado)";
+        } else {
+            qDebug() << "❌ ERRO: Não foi possível criar o arquivo dados_motor.csv";
+            ui->btnGravar->setChecked(false); // Force button back to off state
+        }
+    } else {
+        // Cleanly finalize and save file to disk
+        gravando_csv = false;
+        if(arquivoCSV.isOpen()) {
+            arquivoCSV.close();
+            qDebug() << ">>> GRAVAÇÃO FINALIZADA (Arquivo dados_motor.csv salvo com sucesso!)";
+        }
+        ui->btnGravar->setText("Gravar CSV");
     }
 }
